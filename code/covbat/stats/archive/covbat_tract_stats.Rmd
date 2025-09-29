@@ -1,0 +1,181 @@
+data
+  n x p data frame or matrix of observations where p is the number of features and n is the number of subjects.
+
+bat
+  n x 1 factor indicating batch (often equivalent to site or scanner)
+
+covar
+  n x m data frame or matrix of m covariates supplied to model
+
+model
+  ComBat Family supports any models that take arguments formula and data, but are limited to models fitting with identity link (e.g. family = gaussian(link = "identity")). This includes lm, gam, gamlss, rq, lmer, and more
+  
+formula
+  Formula starting with y ~ where y represents each feature
+```{r}
+run_covbat_harmonization <- function(
+  tract,
+  stat,
+  plot = TRUE,
+  json_path = "/Users/mjaskir/cnt/data/borel/sauce/littlab/users/mjaskir/structural_tractometry/data/metadata/scalar_labels_to_filenames.json",
+  covbat_inputs_dir = "/Users/mjaskir/cnt/data/borel/sauce/littlab/users/mjaskir/structural_tractometry/derivatives/covbat/inputs/tract_stats/mni",
+  covbat_outputs_dir = "/Users/mjaskir/cnt/data/borel/sauce/littlab/users/mjaskir/structural_tractometry/derivatives/covbat/outputs/tract_stats/mni"
+) {
+  require(ComBatFamily)
+  require(mgcv)
+  require(gridExtra)
+  require(jsonlite)
+  require(ggplot2)
+
+  # Make output directory if it doesn't exist
+  if (!dir.exists(covbat_outputs_dir)) {
+    dir.create(covbat_outputs_dir, recursive = TRUE)
+  }
+
+  # Define valid measures for this stat
+  valid_measures <- names(fromJSON(json_path))
+
+  # Read input files
+  data <- read.csv(file.path(covbat_inputs_dir, paste0(tract, "_", stat, "_data.csv")))
+  bat_orig <- read.csv(file.path(covbat_inputs_dir, paste0(tract, "_", stat, "_bat.csv")))
+  bat <- factor(bat_orig$bat, levels = c(0, 1))
+  covar_orig <- read.csv(file.path(covbat_inputs_dir, paste0(tract, "_", stat, "_covar.csv")))
+  covar <- data.frame(covar_orig)
+  covar$group <- ifelse(
+    covar$group %in% c("penn_controls", "hcpya"), "control",
+    ifelse(covar$group %in% c("penn_epilepsy"), "epilepsy", covar$group)
+  )
+
+  # Subset to only include controls
+  ctl_incl <- which(covar$group == "control")
+  data_ctl <- data[ctl_incl, , drop=FALSE]
+  bat_ctl     <- bat[ctl_incl]
+  covar_ctl <- covar[ctl_incl, , drop = FALSE]
+  
+  # Subset to only include patients
+  epi_incl <- which(covar$group == "epilepsy")
+  data_epi <- data[epi_incl, , drop=FALSE]
+  covar_epi <- covar[epi_incl, , drop = FALSE]
+  
+  epi_data <- data.frame(
+    sub = data_epi$sub,
+    group = covar_epi$group,
+    age = covar_epi$age,
+    sex = covar_epi$sex
+  )
+  
+  epi_data <- data.frame(cbind(epi_data, data_epi[,2:ncol(data_epi)]))
+  # Initialize harmonized data frame with identifying columns
+  harmonized_data <- data.frame(
+    sub = data_ctl$sub,
+    group = covar_ctl$group,
+    age = covar_ctl$age,
+    sex = covar_ctl$sex
+  )
+
+  # Store plots if needed
+  plot_list <- list()
+
+  # Outer loop over measures
+  for (measure in valid_measures) {
+    # Subset data for current measure
+    # print(paste0("-- ", measure))
+    data_measure <- data_ctl[, measure, drop = FALSE]
+
+    # Run CovBat harmonization
+    formula <- y ~ s(age, k = 3, fx = TRUE) + sex
+    model <- covfam(
+      data = data_measure,
+      bat = bat_ctl,
+      covar = covar_ctl,
+      mod = gam,
+      formula = formula,
+      ref.batch = 0
+    )
+
+    # Add harmonized measure to harmonized_data
+    harmonized_data[[measure]] <- model$dat.covbat[, 1]
+
+    # Optional: create plots
+    if (plot) {
+      df_before <- data.frame(cbind(bat_ctl, data_measure))
+      df_after <- data.frame(cbind(bat_ctl, harmonized_data[[measure]]))
+      colnames(df_before) <- c("bat", measure)
+      colnames(df_after) <- c("bat", measure)
+
+      # Change types
+      df_after$bat <- ifelse(df_after$bat == 2, 1, 0)
+      df_after$bat <- as.factor(df_after$bat)
+      df_after[,2] <- as.numeric(df_after[,2])
+      
+      before_plot <- ggplot(df_before, aes(x = bat, y = .data[[measure]])) +
+        geom_violin(fill = "lightblue", alpha = 0.5) +
+        geom_jitter(width = 0.1) +
+        ggtitle(paste("Before CovBat")) +
+        scale_x_discrete(labels = c("Penn", "HCP-YA")) +
+        labs(x="Site", y=toupper(gsub("_", " ", measure))) +
+        ylim(range(c(df_before[[measure]], df_after[[measure]]))) +
+        theme(plot.title = element_text(size = 18),
+              axis.title.x = element_text(size=18),
+              axis.title.y = element_text(size=18),
+              axis.text.x = element_text(size=18),
+              axis.text.y = element_text(size=18))
+
+      after_plot <- ggplot(df_after, aes(x = bat, y = .data[[measure]])) +
+        geom_violin(fill = "lightgreen", alpha = 0.5) +
+        geom_jitter(width = 0.1) +
+        ggtitle(paste("After CovBat")) +
+        scale_x_discrete(labels = c("Penn", "HCP-YA")) +
+        labs(x="Site", y=toupper(gsub("_", " ", measure))) +
+        ylim(range(c(df_before[[measure]], df_after[[measure]]))) +
+        theme(plot.title = element_text(size = 18),
+              axis.title.x = element_text(size=18),
+              axis.title.y = element_text(size=18),
+              axis.text.x = element_text(size=18),
+              axis.text.y = element_text(size=18))
+
+      plot_list[[measure]] <- grid.arrange(before_plot, after_plot, ncol = 2 )
+    }
+  }
+
+  # Save harmonized data to a single CSV
+  all_data <- rbind(harmonized_data, epi_data)
+  write.csv(
+    all_data,
+    file.path(covbat_outputs_dir, paste0(tract, "_", stat, "_covbat.csv")),
+    row.names = FALSE, quote = FALSE
+  )
+
+  # Return results
+  return(list(
+    all_data = all_data,
+    plots = if (plot) plot_list else NULL
+  ))
+}
+
+```
+
+
+Run all data
+```{r}
+tract_labels <- c("C_FPH_L", "C_FPH_R", "C_PH_L", "C_PH_R", "C_PO_L", "C_PO_R", "F_L", "F_R", "UF_L", "UF_R")
+stats <- c("mean", "median")
+json_path = "/Users/mjaskir/cnt/data/borel/sauce/littlab/users/mjaskir/structural_tractometry/data/metadata/scalar_labels_to_filenames.json"
+
+
+for (tract in tract_labels) {
+  for (stat in stats) {
+
+    print(paste0(tract, ' - ', stat))
+    run_covbat_harmonization(tract, stat, plot=FALSE)
+
+  }
+}
+
+```
+
+
+Run test case
+```{r}
+run_covbat_harmonization('UF_L', 'median', plot=TRUE)
+```

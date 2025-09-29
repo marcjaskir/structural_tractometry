@@ -1,0 +1,183 @@
+
+```{r}
+run_covbat_harmonization <- function(covbat_label,
+  roi,
+  stat,
+  space = "mni",
+  method = "reference-penn",
+  measures_json_path = "/mnt/sauce/littlab/users/mjaskir/structural_tractometry/data/metadata/scalar_labels_to_filenames.json"
+) {
+
+  library(ComBatFamily)
+  library(mgcv)
+  library(jsonlite)
+
+  # Define inputs/outputs directories
+  covbat_inputs_dir = paste0("/mnt/sauce/littlab/users/mjaskir/structural_tractometry/derivatives/covbat/inputs/", covbat_label, "/", space, "/", method)
+  covbat_outputs_dir = paste0("/mnt/sauce/littlab/users/mjaskir/structural_tractometry/derivatives/covbat/outputs/", covbat_label, "/", space, "/", method)
+
+  # Make output directory if it doesn't exist
+  if (!dir.exists(covbat_outputs_dir)) {
+    dir.create(covbat_outputs_dir, recursive = TRUE)
+  }
+
+  # Load valid measures from JSON
+  valid_measures <- names(fromJSON(measures_json_path))
+
+  # Read and process input files
+  data <- read.csv(file.path(covbat_inputs_dir, paste0(roi, "_", stat, "_data.csv")))
+  bat_orig <- read.csv(file.path(covbat_inputs_dir, paste0(roi, "_", stat, "_bat.csv")))
+  covar_orig <- read.csv(file.path(covbat_inputs_dir, paste0(roi, "_", stat, "_covar.csv")))
+  
+  # Process batch and covariate data
+  bat <- factor(bat_orig$bat, levels = c(0, 1))
+  covar <- data.frame(covar_orig)
+
+  # if (method == "reference-penn") {
+
+  #   # Get number of epilepsy patients (n_epilepsy) by looking at the number of rows in covar_orig where group == "penn_epilepsy"
+  #   n_epilepsy <- sum(covar_orig$group == "penn_epilepsy")
+
+  #   # Get number of HCP-YA patients (n_hcpya) by looking at the number of rows in covar_orig where group == "hcpya"
+  #   n_hcpya <- sum(covar_orig$group == "hcpya")
+
+  #   # Get number of Penn controls (n_penn_controls) by looking at the number of rows in covar_orig where group == "penn_controls"
+
+  # }
+
+  # Get number of epilepsy patients
+  covar$dx[covar$group %in% c("penn_controls", "hcpya")] <- "control"
+  covar$dx[covar$group == "penn_epilepsy"] <- "epilepsy"
+  n_epilepsy <- sum(covar$dx == "epilepsy")
+
+  # Put the first n_epilepsy HCP-YA subjects in the test set, the rest in the train set
+  hcpya_indices <- which(covar$group == "hcpya")
+  hcpya_test_indices <- hcpya_indices[1:n_epilepsy]
+  hcpya_train_indices <- hcpya_indices[-c(1:n_epilepsy)]
+  
+  # Train on Penn and HCP-YA controls - create train/test indices
+  train_indices <- c(
+    which(covar$group == "penn_controls"), # Penn controls
+    hcpya_train_indices
+  )
+
+  # Apply on epilepsy + held-out HCP-YA
+  test_indices <- c(
+    which(covar$group == "penn_epilepsy"), # Penn epilepsy
+    hcpya_test_indices
+  )
+
+  # Get subject IDs for train/test sets
+  sub_train <- covar$sub[train_indices]
+  sub_test <- covar$sub[test_indices]
+
+  # Split data, batch, and covariates into train/test sets
+  data_train <- data[train_indices, , drop = FALSE]
+  data_test <- data[test_indices, , drop = FALSE]
+
+  bat_train <- bat[train_indices]
+  bat_test <- bat[test_indices]
+  
+  covar_train <- covar[train_indices, -which(names(covar) == "sub"), drop = FALSE]
+  covar_test <- covar[test_indices, -which(names(covar) == "sub"), drop = FALSE]
+
+  # Outer loop over measures
+  for (measure in valid_measures) {
+
+    # Subset train/test data for current measure
+    data_measure_train <- data_train[, measure, drop = FALSE]
+    data_measure_test <- data_test[, measure, drop = FALSE]
+
+    # Run CovBat harmonization on training data
+    formula <- y ~ s(age, k = 3, fx = TRUE) + sex
+
+    model <- covfam(
+      data = data_measure_train,
+      bat = bat_train,
+      covar = covar_train,
+      mod = gam,
+      formula = formula,
+      ref.batch = 1
+    )
+    harmonized_train <- model$dat.covbat
+    harmonized_train_df <- cbind(
+      sub_train,
+      covar_train,
+      bat_train,
+      harmonized_train
+    )
+    colnames(harmonized_train_df)[colnames(harmonized_train_df) == "sub_train"] <- "sub"
+    colnames(harmonized_train_df)[colnames(harmonized_train_df) == "bat_train"] <- "bat"
+
+    # Apply harmonization to test data
+    test_apply <- predict(
+      model,
+      newdata = data_measure_test,
+      newbat = bat_test,
+      newcovar = covar_test
+    )
+    harmonized_test <- test_apply$dat.covbat
+    harmonized_test_df <- cbind(
+      sub_test,
+      covar_test,
+      bat_test,
+      harmonized_test
+    )
+    colnames(harmonized_test_df)[colnames(harmonized_test_df) == "sub_test"] <- "sub"
+    colnames(harmonized_test_df)[colnames(harmonized_test_df) == "bat_test"] <- "bat"
+
+    # Combine harmonized train and test data using original indices
+    harmonized_data <- rbind(
+      harmonized_train_df,
+      harmonized_test_df
+    )
+
+    # Add original measure values for plotting
+    harmonized_data[[paste0(measure, "_orig")]] <- c(
+      data_measure_train[[measure]],
+      data_measure_test[[measure]]
+    )
+
+    # Reorder so that penn_epilepsy is first, then penn_controls, then hcpya in the group column
+    harmonized_data$group <- factor(
+      harmonized_data$group,
+      levels = c("penn_epilepsy", "penn_controls", "hcpya")
+    )
+    harmonized_data <- harmonized_data[order(harmonized_data$group), ]
+
+    # Make a measure-specific output directory
+    measure_dir <- paste0(covbat_outputs_dir, '/', measure)
+    if (!dir.exists(measure_dir)) {
+      dir.create(measure_dir, recursive = TRUE)
+    }
+
+    # Save harmonized data to CSV
+    write.csv(
+      harmonized_data,
+      paste0(measure_dir, "/", roi, "_", stat, "_", measure, "_covbat.csv"),
+      row.names = FALSE,
+      quote = FALSE
+    )
+
+  }
+
+}
+
+covbat_label <- "region_stats"
+stats <- c("mean", "median")
+
+covbat_inputs_dir <- "/mnt/sauce/littlab/users/mjaskir/structural_tractometry/derivatives/covbat/inputs"
+
+# Get list of ROIs from input directory
+roi_files <- list.files(paste0(covbat_inputs_dir, '/', covbat_label, '/mni'))
+rois <- unique(sapply(roi_files, function(roi) {
+  gsub("(_mean|_median).*", "", roi)
+}))
+
+for (roi in rois) {
+  for (stat in stats) {
+    print(paste0("Running CovBat for ", roi, " ", stat))
+    run_covbat_harmonization(covbat_label, roi, stat)
+  }
+}
+```

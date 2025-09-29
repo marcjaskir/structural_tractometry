@@ -1,0 +1,96 @@
+
+
+```{r}
+require(mgcv)
+require(jsonlite)
+library(ggplot2)
+
+# Inputs
+covbat_inputs_type <- "regions"
+if (covbat_inputs_type == "tracts") {
+  atlas_label <- "HCP1065"
+} else if (covbat_inputs_type == "regions") {
+  atlas_label <- "4S156"
+} else {
+  stop("Invalid covbat_inputs_type")
+}
+
+covbat_outputs_dir <- paste0("/mnt/sauce/littlab/users/mjaskir/structural_tractometry/derivatives/covbat/outputs/", covbat_inputs_type, "/", atlas_label)
+gam_outputs_dir <- paste0("/mnt/sauce/littlab/users/mjaskir/structural_tractometry/derivatives/gam/outputs/", covbat_inputs_type, "/", atlas_label)
+
+run_gam <- function(covbat_inputs_type,
+  roi, 
+  stat,
+  covbat_outputs_dir,
+  gam_outputs_dir,
+  measures_json_path="/mnt/sauce/littlab/users/mjaskir/structural_tractometry/data/metadata/scalar_labels_to_filenames.json") {
+
+  # Read measures json
+  valid_measures <- names(fromJSON(measures_json_path))
+
+  for (measure in valid_measures) {
+
+    # Read CovBat file
+    covbat_file <- file.path(covbat_outputs_dir, roi, paste0(roi, "_", stat, "_", measure, "_covbat.csv"))
+    if (!file.exists(covbat_file)) {
+      print(paste0("CovBat file not found for ", roi, " ", stat, " ", measure))
+    }
+    covbat_df <- read.csv(covbat_file)
+
+    # Create ROI-specific outputs directory
+    if (!dir.exists(file.path(gam_outputs_dir, roi))) {
+      dir.create(file.path(gam_outputs_dir, roi), recursive = TRUE)
+    }
+  
+    # Get controls data
+    controls_data <- covbat_df[covbat_df$group == "penn_controls",]
+  
+    # Initialize z-scores and centiles for all subjects
+    z_scores <- data.frame(sub=covbat_df$sub)
+    centiles <- data.frame(sub=covbat_df$sub)
+
+    formula <- as.formula(paste(measure, "~ s(age, k=3, fx=T) + sex"))
+    gam_model <- gam(formula, data = controls_data)
+    
+    # Calculate residuals and reference distribution
+    controls_residuals <- residuals(gam_model)
+    sd_control <- sd(controls_residuals)
+    
+    # Predict for all subjects
+    all_pred <- predict(gam_model, newdata = covbat_df)
+    all_residuals <- covbat_df[[measure]] - all_pred
+    
+    # Calculate z-scores and centiles for all subjects
+    z_scores[[measure]] <- all_residuals / sd_control
+    centiles[[measure]] <- ecdf(controls_residuals)(all_residuals) * 100
+    
+    # Create output dataframe with z-scores and centiles
+    output_df <- covbat_df
+    output_df$z <- z_scores[[measure]]
+    output_df$centile <- centiles[[measure]]
+    output_df[[paste0(measure, "_pred")]] <- all_pred
+    # output_df[[paste0(measure, "_resid")]] <- all_residuals
+
+    # Save combined scores
+    write.csv(output_df,
+              file.path(gam_outputs_dir, roi, paste0(roi, "_", stat, "_", measure, "_gam.csv")),
+              row.names = FALSE,
+              quote = FALSE)
+  }
+}
+
+
+# Get ROIs from an example diffusion parameter subdirectory (dki_ad)
+roi_files <- list.files(covbat_outputs_dir)
+rois <- unique(sapply(roi_files, function(roi) {
+  gsub("(_mean|_median).*", "", roi)
+}))
+
+for (roi in rois) {
+  for (stat in c("mean", "median")) {
+    print(paste0("Running GAM for ", roi, " ", stat))
+    run_gam(covbat_inputs_type, roi, stat, covbat_outputs_dir, gam_outputs_dir)
+  }
+}
+```
+

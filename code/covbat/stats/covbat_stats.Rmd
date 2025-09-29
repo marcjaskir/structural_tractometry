@@ -1,0 +1,200 @@
+# CovBat harmonization of tract stats
+
+```{r}
+run_covbat_harmonization <- function(covbat_inputs_type,
+  atlas_label,
+  roi,
+  stat,
+  space = "mni",
+  measures_json_path = "/mnt/sauce/littlab/users/mjaskir/structural_tractometry/data/metadata/scalar_labels_to_filenames.json",
+  train_prop = 0.9
+) {
+
+  library(ComBatFamily)
+  library(mgcv)
+  library(jsonlite)
+
+  # Define inputs/outputs directories
+  covbat_inputs_dir = paste0("/mnt/sauce/littlab/users/mjaskir/structural_tractometry/derivatives/covbat/inputs/", covbat_inputs_type, "/", atlas_label, "/", roi)
+  covbat_outputs_dir = paste0("/mnt/sauce/littlab/users/mjaskir/structural_tractometry/derivatives/covbat/outputs/", covbat_inputs_type, "/", atlas_label, "/", roi)
+
+  # Make output directory if it doesn't exist
+  if (!dir.exists(covbat_outputs_dir)) {
+    dir.create(covbat_outputs_dir, recursive = TRUE)
+  }
+
+  # Load valid measures from JSON
+  valid_measures <- names(fromJSON(measures_json_path))
+
+  # Read and process input files
+  data <- read.csv(file.path(covbat_inputs_dir, paste0(roi, "_", stat, "_data.csv")))
+  bat_orig <- read.csv(file.path(covbat_inputs_dir, paste0(roi, "_", stat, "_bat.csv")))
+  covar_orig <- read.csv(file.path(covbat_inputs_dir, paste0(roi, "_", stat, "_covar.csv")))
+  
+  # Stratified train/test split by batch (bat)
+  set.seed(052525)  # for reproducibility
+
+  # Add a column to covar_orig for train/test split
+  covar_orig$split <- NA
+
+  # Get unique batch values and convert to factor
+  unique_bats <- unique(bat_orig$bat)
+  bat <- factor(bat_orig$bat, levels = unique_bats)
+
+  for (b in unique_bats) {
+    # Indices for this batch
+    idx <- which(bat_orig$bat == b)
+    n <- length(idx)
+    n_train <- floor(train_prop * n)
+    # Randomly sample indices for training
+    train_idx <- sample(idx, n_train)
+    test_idx <- setdiff(idx, train_idx)
+    covar_orig$split[train_idx] <- "train"
+    covar_orig$split[test_idx] <- "test"
+  }
+
+  # Print split breakdown for each unique batch
+  # for (b in unique_bats) {
+  #   cat(sprintf("Batch: %s\n", b))
+  #   print(table(covar_orig$split[bat_orig$bat == b]))
+  #   cat("\n")
+  # }
+
+  # Process batch and covariate data
+  # scanner_id_levels <- unique(bat_orig$bat)
+  # print(bat_orig$bat)
+  # print(scanner_id_levels)
+  # bat <- factor(bat_orig$bat, levels = scanner_id_levels)
+
+  # Convert covar_orig to data frame
+  covar <- data.frame(covar_orig)
+  
+  # Get train/test indices
+  train_indices <- which(covar$split == "train")
+  test_indices <- which(covar$split == "test")
+
+  # Get subject IDs for train/test sets
+  sub_train <- covar$sub[train_indices]
+  sub_test <- covar$sub[test_indices]
+
+  # Split data, batch, and covariates into train/test sets
+  data_train <- data[train_indices, -which(names(data) == "sub"), drop = FALSE]
+  data_test <- data[test_indices, -which(names(data) == "sub"), drop = FALSE]
+
+  bat_train <- bat[train_indices]
+  bat_test <- bat[test_indices]
+  
+  covar_train <- covar[train_indices, -which(names(covar) %in% c("sub", "split")), drop = FALSE]
+  covar_test <- covar[test_indices, -which(names(covar) %in% c("sub", "split")), drop = FALSE]
+
+  # Outer loop over measures
+  for (measure in valid_measures) {
+
+    # Subset train/test data for current measure
+    data_measure_train <- data_train[, measure, drop = FALSE]
+    data_measure_test <- data_test[, measure, drop = FALSE]
+
+    # Run CovBat harmonization on training data
+    formula <- y ~ s(age, k = 3, fx = TRUE) + sex
+
+    # Print dimensions of data, bat, and covar
+    # print(dim(data_measure_train))
+    # print(dim(bat_train))
+    # print(dim(covar_train))
+
+    model <- covfam(
+      data = data_measure_train,
+      bat = bat_train,
+      covar = covar_train,
+      mod = gam,
+      formula = formula,
+    )
+    harmonized_train <- model$dat.covbat
+    harmonized_train_df <- cbind(
+      sub_train,
+      covar_train,
+      bat_train,
+      harmonized_train
+    )
+    colnames(harmonized_train_df)[colnames(harmonized_train_df) == "sub_train"] <- "sub"
+    colnames(harmonized_train_df)[colnames(harmonized_train_df) == "bat_train"] <- "bat"
+
+    # Apply harmonization to test data
+    test_apply <- predict(
+      model,
+      newdata = data_measure_test,
+      newbat = bat_test,
+      newcovar = covar_test
+    )
+    harmonized_test <- test_apply$dat.covbat
+    harmonized_test_df <- cbind(
+      sub_test,
+      covar_test,
+      bat_test,
+      harmonized_test
+    )
+    colnames(harmonized_test_df)[colnames(harmonized_test_df) == "sub_test"] <- "sub"
+    colnames(harmonized_test_df)[colnames(harmonized_test_df) == "bat_test"] <- "bat"
+
+    # Combine harmonized train and test data using original indices
+    harmonized_data <- rbind(
+      harmonized_train_df,
+      harmonized_test_df
+    )
+
+    # Add original measure values for plotting
+    harmonized_data[[paste0(measure, "_orig")]] <- c(
+      data_measure_train[[measure]],
+      data_measure_test[[measure]]
+    )
+
+    # Reorder so that penn_epilepsy is first, then penn_controls, then hcpya in the group column
+    harmonized_data$group <- factor(
+      harmonized_data$group,
+      levels = c("penn_epilepsy", "penn_controls", "hcpya", "hcpaging")
+    )
+    harmonized_data <- harmonized_data[order(harmonized_data$group), ]
+
+    # Save harmonized data to CSV
+    write.csv(
+      harmonized_data,
+      paste0(covbat_outputs_dir, "/", roi, "_", stat, "_", measure, "_covbat.csv"),
+      row.names = FALSE,
+      quote = FALSE
+    )
+
+  }
+
+}
+
+# Input
+covbat_inputs_type <- "regions"
+
+# Determine atlas based on input type
+if (covbat_inputs_type == "tracts") {
+  atlas_label <- "HCP1065"
+} else if (covbat_inputs_type == "regions") {
+  atlas_label <- "4S156"
+} else {
+  stop("Invalid covbat_inputs_type")
+}
+
+stats <- c("mean", "median")
+covbat_inputs_dir <- paste0("/mnt/sauce/littlab/users/mjaskir/structural_tractometry/derivatives/covbat/inputs/", covbat_inputs_type, "/", atlas_label)
+
+# Get list of ROIs from input directory
+roi_files <- list.files(covbat_inputs_dir)
+
+# Get base name of roi files
+roi_base_names <- sapply(roi_files, function(roi) {
+  gsub("(_mean|_median).*", "", roi)
+})
+rois <- unique(roi_base_names)
+
+for (roi in rois) {
+  for (stat in stats) {
+    print(paste0("Running CovBat for ", roi, " ", stat))
+    run_covbat_harmonization(covbat_inputs_type, atlas_label, roi, stat)
+  }
+}
+```
